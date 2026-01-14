@@ -1,0 +1,21 @@
+# LLM & LangChain Dependencies (Installed versions)
+langchain==1.2.3
+langchain-openai==1.1.7
+langgraph==1.0.5
+langchain-core==1.2.7
+
+# MCP Integration
+mcp>=1.1.0
+httpx>=0.28.0
+httpx-sse>=0.4.0
+
+# Utilities
+python-dotenv>=1.0.0
+pydantic>=2.12.0
+typing-extensions>=4.15.0
+requests>=2.32.0
+docling==2.63.0
+
+# CLI & Logging
+rich>=13.9.0
+click>=8.1.0

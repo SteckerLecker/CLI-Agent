@@ -11,11 +11,14 @@ from typing import Annotated, TypedDict, Literal
 from rich.console import Console
 from rich.prompt import Confirm
 from rich.panel import Panel
-from langchain_openai import ChatOpenAI
+from openai import OpenAI
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
 from langchain_core.tools import tool
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
+
+from token_manager import get_token_manager
+from history_manager import get_history_manager, MessageRole
 
 
 console = Console()
@@ -351,16 +354,62 @@ DANGEROUS_FS_TOOLS = {
 class FileSystemAgent:
     """Sub-Agent for file system operations with human-in-the-loop."""
 
-    def __init__(self):
-        self.llm = ChatOpenAI(
-            model="qwen3:8b",
-            base_url="http://localhost:11434/v1",
-            api_key="ollama",
-            temperature=0.3,
-        )
+    def __init__(self, base_url: str = "http://localhost:11434/v1", model: str = "qwen3:8b"):
+        self.base_url = base_url
+        self.model = model
+        self.token_manager = get_token_manager()
+        self.history_manager = get_history_manager()
         self.tools = FILESYSTEM_TOOLS
         self.tools_by_name = {t.name: t for t in self.tools}
         self.graph = self._build_graph()
+
+    def _get_client(self) -> OpenAI:
+        """Erstellt einen OpenAI Client mit aktuellem Token."""
+        return OpenAI(
+            base_url=self.base_url,
+            api_key=self.token_manager.get_token(),
+        )
+
+    def _get_tools_schema(self) -> list[dict]:
+        """Convert LangChain tools to OpenAI function format."""
+        tools_schema = []
+        for t in self.tools:
+            tools_schema.append({
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.args_schema.schema() if hasattr(t, 'args_schema') else {"type": "object", "properties": {}}
+                }
+            })
+        return tools_schema
+
+    def _messages_to_openai_format(self, messages: list) -> list[dict]:
+        """Convert LangChain messages to OpenAI format."""
+        openai_messages = []
+        for msg in messages:
+            if isinstance(msg, SystemMessage):
+                openai_messages.append({"role": "system", "content": msg.content})
+            elif isinstance(msg, HumanMessage):
+                openai_messages.append({"role": "user", "content": msg.content})
+            elif isinstance(msg, AIMessage):
+                ai_msg = {"role": "assistant", "content": msg.content or ""}
+                if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                    ai_msg["tool_calls"] = [
+                        {
+                            "id": tc["id"],
+                            "type": "function",
+                            "function": {"name": tc["name"], "arguments": json.dumps(tc["args"])}
+                        } for tc in msg.tool_calls
+                    ]
+                openai_messages.append(ai_msg)
+            elif isinstance(msg, ToolMessage):
+                openai_messages.append({
+                    "role": "tool",
+                    "tool_call_id": msg.tool_call_id,
+                    "content": msg.content
+                })
+        return openai_messages
 
     def _build_graph(self) -> StateGraph:
         """Build the LangGraph agent graph."""
@@ -411,20 +460,41 @@ class FileSystemAgent:
 
     async def _agent_node(self, state: FileSystemAgentState) -> dict:
         """Process messages with the LLM."""
-        llm_with_tools = self.llm.bind_tools(self.tools)
-        response = await llm_with_tools.ainvoke(state["messages"])
+        openai_messages = self._messages_to_openai_format(state["messages"])
+        tools_schema = self._get_tools_schema()
+
+        client = self._get_client()
+        response = client.chat.completions.create(
+            model=self.model,
+            messages=openai_messages,
+            tools=tools_schema if tools_schema else None,
+            temperature=0.3,
+        )
+
+        assistant_message = response.choices[0].message
+        content = assistant_message.content or ""
 
         pending_tool_calls = []
-        if response.tool_calls:
-            for tool_call in response.tool_calls:
+        tool_calls_for_ai_message = []
+
+        if assistant_message.tool_calls:
+            for tool_call in assistant_message.tool_calls:
+                tc_dict = {
+                    "id": tool_call.id,
+                    "name": tool_call.function.name,
+                    "args": json.loads(tool_call.function.arguments)
+                }
                 pending_tool_calls.append({
-                    "id": tool_call["id"],
-                    "name": tool_call["name"],
-                    "arguments": tool_call["args"]
+                    "id": tool_call.id,
+                    "name": tool_call.function.name,
+                    "arguments": json.loads(tool_call.function.arguments)
                 })
+                tool_calls_for_ai_message.append(tc_dict)
+
+        ai_message = AIMessage(content=content, tool_calls=tool_calls_for_ai_message)
 
         return {
-            "messages": [response],
+            "messages": [ai_message],
             "pending_tool_calls": pending_tool_calls,
             "approved_tool_calls": []
         }
@@ -513,7 +583,16 @@ class FileSystemAgent:
         Returns:
             The result of the operation.
         """
-        system_prompt = """Du bist ein Dateisystem-Assistent. Du kannst Dateien und Verzeichnisse lesen, schreiben, erstellen, loeschen, kopieren und verschieben.
+        # Log task to central history
+        self.history_manager.add_user_message(
+            f"[FileSystem Task] {task}",
+            agent_name="FileSystemAgent"
+        )
+
+        # Get context from central history
+        context_summary = self.history_manager.get_context_summary(max_length=1000)
+
+        system_prompt = f"""Du bist ein Dateisystem-Assistent. Du kannst Dateien und Verzeichnisse lesen, schreiben, erstellen, loeschen, kopieren und verschieben.
 
 Verfuegbare Operationen:
 - read_file: Datei lesen
@@ -527,6 +606,9 @@ Verfuegbare Operationen:
 - move_file: Datei verschieben
 - get_file_info: Datei-Informationen abrufen
 - search_files: Dateien suchen (Glob-Pattern)
+
+Kontext aus vorheriger Konversation:
+{context_summary}
 
 Wichtig:
 - Sei vorsichtig mit Loeschoperationen
@@ -555,6 +637,12 @@ Wichtig:
             response = last_message.content
         else:
             response = str(last_message)
+
+        # Log response to central history
+        self.history_manager.add_assistant_message(
+            f"[FileSystem Result] {response[:500]}",
+            agent_name="FileSystemAgent"
+        )
 
         console.print(Panel(
             response,

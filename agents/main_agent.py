@@ -9,15 +9,17 @@ from typing import Annotated, TypedDict, Literal
 from rich.console import Console
 from rich.prompt import Prompt, Confirm
 from rich.panel import Panel
-from langchain_openai import ChatOpenAI
+from openai import OpenAI
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
 from langchain_core.tools import tool
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 
 from mcp_client import MCPManager
+from token_manager import get_token_manager
+from history_manager import get_history_manager, MessageRole
 from .filesystem_agent import FileSystemAgent
-from .webcontent_agent import WebContentAgent
+from .beautifulsoup_agent import BeautifulSoupAgent
 
 
 console = Console()
@@ -45,19 +47,19 @@ def delegate_to_filesystem_agent(task: str) -> str:
 
 
 @tool
-def delegate_to_webcontent_agent(task: str) -> str:
+def delegate_to_beautifulsoup_agent(task: str) -> str:
     """
-    Delegate a web content task to the specialized WebContent Sub-Agent.
-    Use this to fetch, read, or summarize content from websites.
+    Delegate a web scraping task to the BeautifulSoup Sub-Agent.
+    Use this for targeted web scraping with CSS selectors, extracting links, or tables.
 
     Args:
-        task: A description of the web content task to perform.
-              Examples: "Hole den Inhalt von https://example.com",
-                       "Was steht auf der Webseite www.google.de?",
-                       "Fasse die Seite https://news.ycombinator.com zusammen"
+        task: A description of the web scraping task to perform.
+              Examples: "Extrahiere alle Links von https://example.com",
+                       "Hole die Tabellen von der Seite",
+                       "Finde alle Artikel-Ueberschriften (h1, h2) auf der Seite"
 
     Returns:
-        The webpage content as markdown or a summary.
+        The extracted web content.
     """
     # This is a placeholder - actual execution happens in the agent
     return task
@@ -82,26 +84,57 @@ class HumanInTheLoopAgent:
 
     SUB_AGENT_TOOLS = {
         "delegate_to_filesystem_agent",
-        "delegate_to_webcontent_agent"
+        "delegate_to_beautifulsoup_agent"
     }
 
-    def __init__(self, mcp_manager: MCPManager):
+    def __init__(self, mcp_manager: MCPManager, base_url: str = "http://localhost:11434/v1", model: str = "qwen3:8b"):
         self.mcp_manager = mcp_manager
-        self.filesystem_agent = FileSystemAgent()
-        self.webcontent_agent = WebContentAgent()
-        self.llm = ChatOpenAI(
-            model="qwen3:8b",
-            base_url="http://localhost:11434/v1",
-            api_key="ollama",
-            temperature=0.7,
-        )
+        self.base_url = base_url
+        self.model = model
+        self.token_manager = get_token_manager()
+        self.history_manager = get_history_manager()
+        self.filesystem_agent = FileSystemAgent(base_url=base_url, model=model)
+        self.beautifulsoup_agent = BeautifulSoupAgent(base_url=base_url, model=model)
         self.graph = None
-        self.conversation_history: list = []
         self._system_prompt = None
+
+    def _get_client(self) -> OpenAI:
+        """Erstellt einen OpenAI Client mit aktuellem Token."""
+        return OpenAI(
+            base_url=self.base_url,
+            api_key=self.token_manager.get_token(),
+        )
+
+    def _messages_to_openai_format(self, messages: list) -> list[dict]:
+        """Convert LangChain messages to OpenAI format."""
+        openai_messages = []
+        for msg in messages:
+            if isinstance(msg, SystemMessage):
+                openai_messages.append({"role": "system", "content": msg.content})
+            elif isinstance(msg, HumanMessage):
+                openai_messages.append({"role": "user", "content": msg.content})
+            elif isinstance(msg, AIMessage):
+                ai_msg = {"role": "assistant", "content": msg.content or ""}
+                if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                    ai_msg["tool_calls"] = [
+                        {
+                            "id": tc["id"],
+                            "type": "function",
+                            "function": {"name": tc["name"], "arguments": json.dumps(tc["args"])}
+                        } for tc in msg.tool_calls
+                    ]
+                openai_messages.append(ai_msg)
+            elif isinstance(msg, ToolMessage):
+                openai_messages.append({
+                    "role": "tool",
+                    "tool_call_id": msg.tool_call_id,
+                    "content": msg.content
+                })
+        return openai_messages
 
     def clear_history(self) -> None:
         """Clear the conversation history to start a new chat."""
-        self.conversation_history = []
+        self.history_manager.clear()
         console.print("[green]Chat-Verlauf geloescht. Neuer Chat gestartet.[/green]")
 
     def _get_system_prompt(self) -> str:
@@ -128,15 +161,16 @@ class HumanInTheLoopAgent:
 - Der Sub-Agent kann Dateien lesen, schreiben, loeschen, kopieren, verschieben
 - Er kann Verzeichnisse erstellen, auflisten und durchsuchen
 
-3. WebContent Sub-Agent:
-- Nutze delegate_to_webcontent_agent um Webseiten-Inhalte abzurufen
-- Der Sub-Agent kann Webseiten laden und als Markdown konvertieren
-- Nutze dies wenn der Benutzer Informationen von einer Webseite benoetigt
+3. BeautifulSoup Sub-Agent:
+- Nutze delegate_to_beautifulsoup_agent fuer Web-Scraping und Webseiten-Inhalte
+- Der Sub-Agent kann Webseiten laden und Text extrahieren
+- Er kann mit CSS-Selektoren bestimmte Elemente extrahieren
+- Er kann Links und Tabellen von Webseiten extrahieren
 
 Wichtige Hinweise:
 - Beschreibe deine Aktionen klar und warte auf die Ergebnisse
 - Bei Dateioperationen delegiere an den FileSystem Sub-Agent
-- Bei Webseiten-Anfragen delegiere an den WebContent Sub-Agent
+- Bei Webseiten-Anfragen delegiere an den BeautifulSoup Sub-Agent
 
 Antworte auf Deutsch."""
 
@@ -213,18 +247,18 @@ Antworte auf Deutsch."""
             }
         })
 
-        # Add WebContent Sub-Agent delegation tool
+        # Add BeautifulSoup Sub-Agent delegation tool
         tools.append({
             "type": "function",
             "function": {
-                "name": "delegate_to_webcontent_agent",
-                "description": "Delegate a web content task to fetch and read website content. Use this when the user wants to know what's on a webpage, needs information from a URL, or wants a website summarized.",
+                "name": "delegate_to_beautifulsoup_agent",
+                "description": "Delegate a web scraping task using BeautifulSoup. Use this for targeted extraction with CSS selectors, extracting links, tables, or specific HTML elements from webpages.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "task": {
                             "type": "string",
-                            "description": "A description of the web content task. Examples: 'Hole den Inhalt von https://example.com', 'Was steht auf www.google.de?', 'Lade die Seite https://news.ycombinator.com'"
+                            "description": "A description of the web scraping task. Examples: 'Extrahiere alle Links von https://example.com', 'Hole die Tabellen von der Seite', 'Finde alle h1 Ueberschriften auf der Seite'"
                         }
                     },
                     "required": ["task"]
@@ -232,21 +266,40 @@ Antworte auf Deutsch."""
             }
         })
 
-        llm_with_tools = self.llm.bind_tools(tools)
+        openai_messages = self._messages_to_openai_format(state["messages"])
 
-        response = await llm_with_tools.ainvoke(state["messages"])
+        client = self._get_client()
+        response = client.chat.completions.create(
+            model=self.model,
+            messages=openai_messages,
+            tools=tools if tools else None,
+            temperature=0.7,
+        )
+
+        assistant_message = response.choices[0].message
+        content = assistant_message.content or ""
 
         pending_tool_calls = []
-        if response.tool_calls:
-            for tool_call in response.tool_calls:
+        tool_calls_for_ai_message = []
+
+        if assistant_message.tool_calls:
+            for tool_call in assistant_message.tool_calls:
+                tc_dict = {
+                    "id": tool_call.id,
+                    "name": tool_call.function.name,
+                    "args": json.loads(tool_call.function.arguments)
+                }
                 pending_tool_calls.append({
-                    "id": tool_call["id"],
-                    "name": tool_call["name"],
-                    "arguments": tool_call["args"]
+                    "id": tool_call.id,
+                    "name": tool_call.function.name,
+                    "arguments": json.loads(tool_call.function.arguments)
                 })
+                tool_calls_for_ai_message.append(tc_dict)
+
+        ai_message = AIMessage(content=content, tool_calls=tool_calls_for_ai_message)
 
         return {
-            "messages": [response],
+            "messages": [ai_message],
             "pending_tool_calls": pending_tool_calls,
             "approved_tool_calls": [],
             "tool_results": []
@@ -306,9 +359,9 @@ Antworte auf Deutsch."""
                 if tool_name == "delegate_to_filesystem_agent":
                     task = args.get("task", "")
                     result_text = await self.filesystem_agent.run(task)
-                elif tool_name == "delegate_to_webcontent_agent":
+                elif tool_name == "delegate_to_beautifulsoup_agent":
                     task = args.get("task", "")
-                    result_text = await self.webcontent_agent.run(task)
+                    result_text = await self.beautifulsoup_agent.run(task)
                 else:
                     # Execute MCP tool via manager
                     result = await self.mcp_manager.call_tool(tool_name, args)
@@ -351,13 +404,24 @@ Antworte auf Deutsch."""
         if not self.graph:
             self.graph = self._build_graph()
 
-        # Add user message to history
-        self.conversation_history.append(HumanMessage(content=user_input))
+        # Add user message to central history
+        self.history_manager.add_user_message(user_input, agent_name="MainAgent")
 
-        # Build messages with system prompt and full history
+        # Build messages with system prompt and history from HistoryManager
+        history_messages = []
+        for msg in self.history_manager.get_history():
+            if msg.role == MessageRole.USER:
+                history_messages.append(HumanMessage(content=msg.content))
+            elif msg.role == MessageRole.ASSISTANT:
+                history_messages.append(AIMessage(content=msg.content))
+            elif msg.role == MessageRole.SYSTEM:
+                history_messages.append(SystemMessage(content=msg.content))
+            elif msg.role == MessageRole.TOOL:
+                history_messages.append(ToolMessage(content=msg.content, tool_call_id=msg.tool_call_id or ""))
+
         messages = [
             SystemMessage(content=self._get_system_prompt()),
-            *self.conversation_history
+            *history_messages
         ]
 
         initial_state: AgentState = {
@@ -375,8 +439,8 @@ Antworte auf Deutsch."""
         last_message = final_state["messages"][-1]
         if isinstance(last_message, AIMessage):
             response = last_message.content
-            # Add assistant response to history
-            self.conversation_history.append(AIMessage(content=response))
+            # Add assistant response to central history
+            self.history_manager.add_assistant_message(response, agent_name="MainAgent")
         else:
             response = str(last_message)
 
@@ -397,7 +461,7 @@ Antworte auf Deutsch."""
             f"[bold]Willkommen beim KI-Agenten![/bold]\n\n"
             f"{mcp_info}\n"
             f"  - FileSystem Sub-Agent (11 Tools)\n"
-            f"  - WebContent Sub-Agent (3 Tools)\n\n"
+            f"  - BeautifulSoup Sub-Agent (4 Tools)\n\n"
             f"Gefaehrliche Aktionen erfordern Ihre Bestaetigung.\n\n"
             f"[dim]Befehle:[/dim]\n"
             f"[dim]  /new, /clear - Neuen Chat starten[/dim]\n"
@@ -421,7 +485,7 @@ Antworte auf Deutsch."""
 
                 # New chat commands
                 if user_input.lower() in ["/new", "/clear"]:
-                    if self.conversation_history:
+                    if not self.history_manager.is_empty:
                         confirm = Confirm.ask(
                             "[yellow]Moechten Sie den aktuellen Chat wirklich loeschen?[/yellow]",
                             default=False
